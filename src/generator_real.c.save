@@ -1,0 +1,304 @@
+#include "vslc.h"
+
+#define MIN(a,b) (((a)<(b)) ? (a):(b))
+static const char *record[6] = {
+    "%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"
+};
+
+size_t nparms = 0, if_count = 0, while_count = 0;
+
+static void find_variable(node_t* node, char* str);
+static void handle_function_call(node_t* node);
+static void handle_return(node_t* node);
+static void handle_assignment(node_t* node);
+static void handle_printing(node_t* node);
+static void handle_expression(node_t* node);
+static void handle_while_statement(node_t* node);
+static void handle_if_statement(node_t* node);
+static void handle_continue(node_t* node);
+static void assign_variable_value(node_t* node, char* str);
+
+static void
+generate_stringtable ( void )
+{
+    /* These can be used to emit numbers, strings and a run-time
+     * error msg. from main
+     */
+    puts ( ".data" );
+    puts ( "intout: .asciz \"\%ld \"" );
+    puts ( "strout: .asciz \"\%s \"" );
+    puts ( "errint64out: .asciz \"Wrong number of arguments\"" );
+
+    for (int i = 0; i < stringc; i++) {
+        printf("STR%d:\t.string\t%s\n", i, string_list[i]);
+    }
+
+}
+
+
+static void
+generate_main ( symbol_t *first )
+{
+    puts ( ".globl main" );
+    puts ( ".text" );
+    puts ( "main:" );
+    puts ( "\tpushq %rbp" );
+    puts ( "\tmovq %rsp, %rbp" );
+
+    puts ( "\tsubq $1, %rdi" );
+    printf ( "\tcmpq\t$%zu,%%rdi\n", first->nparms );
+    puts ( "\tjne ABORT" );
+    puts ( "\tcmpq $0, %rdi" );
+    puts ( "\tjz SKIP_ARGS" );
+
+    puts ( "\tmovq %rdi, %rcx" );
+    printf ( "\taddq $%zu, %%rsi\n", 8*first->nparms );
+    puts ( "PARSE_ARGV:" );
+    puts ( "\tpushq %rcx" );
+    puts ( "\tpushq %rsi" );
+
+    puts ( "\tmovq (%rsi), %rdi" );
+    puts ( "\tmovq $0, %rsi" );
+    puts ( "\tmovq $10, %rdx" );
+    puts ( "\tcall strtol" );
+
+    /*  Now a new argument is an integer in rax */
+    puts ( "\tpopq %rsi" );
+    puts ( "\tpopq %rcx" );
+    puts ( "\tpushq %rax" );
+    puts ( "\tsubq $8, %rsi" );
+    puts ( "\tloop PARSE_ARGV" );
+
+    /* Now the arguments are in order on stack */
+    for ( int arg=0; arg<MIN(6,first->nparms); arg++ )
+        printf ( "\tpopq\t%s\n", record[arg] );
+
+    puts ( "SKIP_ARGS:" );
+    printf ( "\tcall\t_%s\n", first->name );
+    puts ( "\tjmp END" );
+    puts ( "ABORT:" );
+    puts ( "\tmovq $errout, %rdi" );
+    puts ( "\tcall puts" );
+
+    puts ( "END:" );
+    puts ( "\tmovq %rax, %rdi" );
+    puts ( "\tcall exit" );
+}
+
+void print_global_variables() {
+	size_t n_globals = tlhash_size(global_names);
+	symbol_t *global_list[n_globals];
+	tlhash_values ( global_names, (void **)&global_list );
+	puts(".data");
+	for (int i = 0; i < n_globals; i++) {
+		if (global_list[i]->type == SYM_GLOBAL_VAR) {
+			printf("_%s:\t.zero\t8\n", global_list[i]->name);	//come back to this
+    		}
+	}
+}
+
+void print_string(int64_t string_num) {
+	printf("\tmovq $STR%d, %%rsi\n", (int) string_num);
+	puts("\tmovq $strout, %rdi");
+	puts("\tcall printf");
+}
+
+void print_int(char* dest) {
+	puts("\tmovq $intout, %rdi");
+	puts("\tcall printf");
+}
+
+void print_new_line() {
+	puts("\tmovq $'\\n', %rdi");
+	puts("\tcall putchar");
+}
+
+
+void find_variable(node_t* node, char* desti) {
+	switch(node->type) {
+		case EXPRESSION:
+			handle_expression(node);
+			if (strcmp(dest, "%rax")) {
+				printf("\tmovq %%rax, %s\n", desti);
+            		}
+            		break;
+        	case IDENTIFIER_DATA:
+            		switch (node->entry->type) {
+                		int64_t seq = 0;
+                		case SYM_PARAMETER:
+                    			seq = node->entry->seq;
+                    			printf("\tmovq %s%d(%%rbp), %s\n", seq >= 6 ? "" : "-", (int) (8 * (seq >= 6 ? seq - 4 : seq + 1)), desti);
+                    			break;
+                		case SYM_GLOBAL_VAR:
+                    			printf("\tmovq _%s, %s\n", node->entry->name, desti);
+                   			break;
+                		case SYM_LOCAL_VAR:
+                    			printf("\tmovq -%d(%%rbp), %s\n", (int) (8 * (node->entry->seq + MIN(nparms, 6) + 1)), desti);
+                    			break;
+            		}
+            		break;
+        	case NUMBER_DATA:
+            		printf("\tmovq $%d, %s\n", (int) *((int64_t*)node->data), desti);
+            		break;
+
+	}
+}
+
+void handle_function_call(node_t* node) {
+    	int64_t param_count = node->children[1] == NULL ? 0 : node->children[1]->n_children;
+    	if (param_count > 6) {
+        	for (int i = param_count - 1; i >= 6; i--) {
+            		find_variable(node->children[1]->children[i], "%rax");
+            		puts("\tpushq %rax");
+        	}
+    	}
+    	for (int i = 0; i < MIN(param_count, 6); i++) {
+        	find_variable(node->children[1]->children[i], (char *) record[i]);
+    	}
+    	printf("\tcall _%s\n", (char *) node->children[0]->data);
+}
+
+void handle_return(node_t* node) {
+    	node_t* child = node->children[0];
+    	switch (child->type) {
+        	case EXPRESSION:
+        	case IDENTIFIER_DATA:
+        	case NUMBER_DATA:
+            		find_variable(child, "%rax");
+            		break;
+    	}
+    	puts("\tleave");
+    	puts("\tret");
+}
+
+
+void assign_variable_value(node_t* node, char* destination) {
+    	switch (node->entry->type) {
+        	int64_t seq = 0;
+        	case SYM_PARAMETER:
+           		seq = node->entry->seq;
+            		printf("\tmovq %s, %s%d(%%rbp)\n", destination, seq >= 6 ? "" : "-", 8 * ((int) (seq >= 6 ? seq - 4 : seq + 1)));
+            		break;
+        	case SYM_GLOBAL_VAR:
+            		printf("\tmovq %s, _%s\n", destination, node->entry->name);
+            		break;
+        	case SYM_LOCAL_VAR:
+            		printf("\tmovq %s, -%d(%%rbp)\n", destination, (int) (8 * ((int) node->entry->seq + MIN(nparms, 6) + 1)));
+            		break;
+    	}
+}
+
+void handle_assignments(node_t* node) {
+    	find_variable(node->children[1], "%rax");
+    	assign_variable_value(node->children[0], "%rax");
+}
+
+void handle_printing(node_t* node) {
+	for (int i = 0; i < node->n_children; i++) {
+        	node_t* child = node->children[i];
+        	switch(child->type) {
+            		case EXPRESSION:
+            		case IDENTIFIER_DATA:
+            		case NUMBER_DATA:
+                		find_variable(child, "%rsi");
+                		print_int("%rsi");
+                		break;
+            		case STRING_DATA:
+               			print_str(*((int64_t*)child->data));
+                		break;
+        	}
+    	}
+    	print_new_line();
+}
+
+void handle_expression(node_t* node) {
+	if (node->n_children == 2 && (node->children[1] == NULL || node->children[1]->type == EXPRESSION_LIST)) {
+        	handle_function_call(node);
+    	} else if (node->data != NULL && node->n_children == 2) {
+        	char* op = (char *) node->data;
+        	switch (*op) {
+            		case '<':
+                		find_variable(node->children[0], "%rax");
+                		printf("\tmovq %%rax, %%rcx\n");
+                		find_variable(node->children[1], "%rax");
+                		printf("\txchgq %%rax, %%rcx\n");
+                		printf("\tsalq %s, %%rax\n", "%cl");
+                		return;
+
+            		case '>':
+                		find_variable(node->children[0], "%rax");
+                		printf("\tmovq %%rax, %%rcx\n");
+                		find_variable(node->children[1], "%rax");
+                		printf("\txchgq %%rax, %%rcx\n");
+                		printf("\tsarq %s, %%rax\n", "%cl");
+                		return;
+		}
+        	int mul_div_test = *op == '*' || *op == '/';
+        	if (mul_div_test) {
+            		puts("\tpushq %rdx");
+        	}
+        	find_variable(node->children[mul_div_test ? 1 : 0], "%rax");
+        	puts("\tpushq %rax");
+        	find_variable(node->children[mul_div_test ? 0 : 1], "%rax");
+        	switch (*op) {
+            		case '+':
+                		puts("\taddq %rax, (%rsp)");
+                		break;
+            		case '-':
+                		puts("\tsubq %rax, (%rsp)");
+                		break;
+            		case '*':
+                		puts("\tmulq (%rsp)");
+                		puts("\tpopq %rdx");
+                		puts("\tpopq %rdx");
+                		break;
+            		case '/':
+                		puts("\tcqo");
+                		puts("\tidivq (%rsp)");
+                		puts("\tpopq %rdx");
+                		puts("\tpopq %rdx");
+                		break;
+            		case '&':
+                		puts("\tandq %rax, (%rsp)");
+                		break;
+            		case '|':
+                		puts("\torq %rax, (%rsp)");
+                		break;
+            		case '^':
+                		puts("\txorq %rax, (%rsp)");
+                		break;
+        	}
+        	if (!mul_div_test) {
+            		puts("\tpopq %rax");
+		}
+	} else if (node->n_children == 1) {
+        	find_variable(node->children[0], "%rax");
+        	switch(*((char*)node->data)) {
+            		case '-':
+                		puts("\tnegq %rax");
+                		break;
+            		case '~':
+                		puts("\tnotq %rax");
+                		break;
+        	}
+    	}
+}
+
+
+void
+generate_program ( void )
+{
+	generate_stringtable();
+	print_global_variables();
+	size_t n_globals = tlhash_size(global_names);
+	symbol_t *global_list[n_globals];
+	tlhash_values ( global_names, (void **)&global_list );
+	for (int i = 0; i < n_globals; i++) {
+		if (global_list[i]->type == SYM_FUNCTION && global_list[i]->seq == 0) {
+			generate_main(global_list[i]);
+			break;
+        	}
+    	}
+	print_functions();
+}
+
